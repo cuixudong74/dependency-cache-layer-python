@@ -74,9 +74,22 @@ a single entry directly.
 
 - Capacity is configurable and hard-capped (`1..100_000`) to prevent
   misconfiguration from causing unbounded memory growth.
-- When capacity is exceeded, the least-recently-used entry is evicted
-  (LRU). Entries with a refresh in flight are never chosen as victims.
-- Evicted entries are reloaded from the upstream on the next read.
+- When capacity is exceeded, the least-recently-used **reclaimable** entry
+  is evicted (LRU). Two kinds of entries are never chosen as victims:
+  - an entry with a background refresh in flight is **pinned** — it cannot
+    be reclaimed mid-refresh and automatically re-enters the reclaimable
+    pool when the refresh finishes;
+  - a just-written entry is never dropped by its own insertion, so a fresh
+    write is always served from cache afterwards (no immediate re-fetch).
+- To guarantee a reclaimable victim always exists, the number of pinned
+  (refreshing) entries is capped at `capacity - 1`. When that many
+  refreshes are already in flight, a stale read is still served normally
+  but no additional background refresh is started; the next stale read
+  retries. This keeps `len(cache) <= capacity` at **every** instant, no
+  matter how many refreshes are in flight, so memory usage stays bounded
+  in the long run.
+- Evicted entries are reloaded from the upstream on the next read and
+  re-cached as complete entries.
 
 ## Observability
 
@@ -135,8 +148,11 @@ with `FakeClock`.
 
 ## Tests
 
+Run the whole suite from the repository root with uv (no extra flags or
+wrappers needed; `pyproject.toml` configures `pythonpath`/`testpaths`):
+
 ```bash
-python -m pytest tests/ -q
+uv run pytest
 ```
 
 The test suite covers: threshold boundaries, stale-while-revalidate,
@@ -144,4 +160,13 @@ background and synchronous refresh failure with degradation, not-found vs
 fault distinction (timeout/error/malformed), precise dependency
 invalidation, concurrent reads sharing a single refresh without mixed
 versions, background refresh concurrency limit, LRU eviction and reload,
-metrics, and graceful shutdown (no half-written entries, no blocking).
+capacity/eviction under concurrent background refreshes (new inserts
+survive, pinned entries are skipped and later re-enter the pool, the
+capacity bound holds at every instant, evicted entries reload), metrics,
+and graceful shutdown (no half-written entries, no blocking).
+
+To verify the capacity/concurrency behavior specifically:
+
+```bash
+uv run pytest tests/test_cache_layer.py -k "refresh or evict or capacity"
+```

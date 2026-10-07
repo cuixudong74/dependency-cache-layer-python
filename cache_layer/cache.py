@@ -45,6 +45,13 @@ class CacheLayer:
     :class:`CacheEntry` reference, so a reader never observes a half-written
     version. Background refreshes are bounded by a semaphore and tracked so
     :meth:`shutdown` can cancel them.
+
+    Capacity model: an entry with a background refresh in flight is *pinned*
+    (never an eviction victim) and re-enters the reclaimable pool when the
+    refresh finishes. The number of pinned entries is capped at
+    ``capacity - 1`` so a reclaimable LRU victim always exists; together with
+    the rule that a just-written entry is never evicted by its own insertion,
+    ``len(cache)`` never exceeds ``config.capacity`` under any interleaving.
     """
 
     def __init__(self, config: CacheConfig, clock: Clock | None = None) -> None:
@@ -198,6 +205,14 @@ class CacheLayer:
     def _spawn_background_refresh(self, key: str, loader: Loader) -> None:
         if key in self._refreshing:
             return  # a refresh for this key is already in flight
+        # Pin budget: an entry with a refresh in flight is pinned (never an
+        # eviction victim). Keeping the number of pinned entries below the
+        # capacity guarantees eviction always has a reclaimable victim, so
+        # the capacity bound holds at every instant and a just-written entry
+        # is never sacrificed. When the budget is exhausted the stale read is
+        # still served; the next stale read retries the spawn.
+        if len(self._refreshing) >= max(0, self._config.capacity - 1):
+            return
         self._metrics.background_refresh_started += 1
         task = asyncio.create_task(self._background_refresh(key, loader))
         self._refreshing[key] = task
@@ -312,19 +327,30 @@ class CacheLayer:
     def _evict_if_needed(self, just_inserted: str) -> None:
         """Evict least-recently-used entries until within capacity.
 
-        Keys with a refresh in flight are never chosen as victims.
+        Victim selection is restricted to *reclaimable* entries:
+
+        - keys with a refresh in flight are pinned and never chosen; they
+          re-enter the reclaimable pool when the refresh finishes;
+        - the just-written key is never chosen, so a fresh write is never
+          dropped by its own insertion.
+
+        Because the number of pinned entries is capped below the capacity
+        (see :meth:`_spawn_background_refresh`), a reclaimable victim always
+        exists when the cache is over capacity, and ``len(self._entries)``
+        never exceeds ``config.capacity``.
         """
         while len(self._entries) > self._config.capacity:
             candidates = [
                 (e.last_access, k)
                 for k, e in self._entries.items()
-                if k not in self._refreshing
+                if k not in self._refreshing and k != just_inserted
             ]
             if not candidates:
+                # Unreachable while the pin budget holds; kept as a safety
+                # net so a bug can never evict the just-written entry.
                 break
             candidates.sort(key=lambda item: (item[0], item[1]))
             _, victim = candidates[0]
             self._entries.pop(victim, None)
-            if victim not in self._refreshing:
-                self._locks.pop(victim, None)
+            self._locks.pop(victim, None)  # victims are never refreshing
             self._metrics.evictions += 1

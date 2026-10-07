@@ -10,3 +10,9 @@ dependencies = [
 [[tool.uv.index]]
 url = "https://mirrors.aliyun.com/pypi/simple/"
 default = true
+
+[tool.pytest.ini_options]
+# Make the repo root importable so `uv run pytest` works from the repo root
+# without any extra startup flags or wrappers.
+pythonpath = ["."]
+testpaths = ["tests"]

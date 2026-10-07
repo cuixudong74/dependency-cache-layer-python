@@ -708,3 +708,237 @@ def test_stale_ttl_zero_disables_stale_window(clock):
     assert r.status == ReadStatus.HIT
     assert r.value == "v2"
     assert cache.metrics().stale_returns == 0
+
+
+# ---------------------------------------------------------------------------
+# 10. Capacity & eviction under concurrent background refreshes
+# ---------------------------------------------------------------------------
+
+
+def test_new_insert_is_not_dropped_while_refreshes_in_flight(clock):
+    """capacity=3, several entries refreshing (pinned): a new insert must evict
+    the LRU reclaimable entry, never the just-written one."""
+    upstream = MockUpstream()
+    cache = make_cache(clock, capacity=3)
+    loaders = {}
+    for name in ("a", "b", "c", "d"):
+        upstream.set(name, name)
+        loaders[name] = make_loader(upstream, name, (name,))
+
+    async def scenario():
+        await cache.get("a", loaders["a"])
+        clock.advance(1.0)
+        await cache.get("b", loaders["b"])
+        clock.advance(1.0)
+        await cache.get("c", loaders["c"])
+
+        # Refreshes hang in flight (per-key upstream latency).
+        upstream.configure("a", delay=0.5)
+        upstream.configure("b", delay=0.5)
+        upstream.configure("c", delay=0.5)
+        clock.advance(13.0)  # all entries enter the stale window
+        ra = await cache.get("a", loaders["a"])
+        rb = await cache.get("b", loaders["b"])
+        rc = await cache.get("c", loaders["c"])
+        assert ra.status == rb.status == rc.status == ReadStatus.STALE
+        # The pin budget is capacity - 1 == 2: a and b refresh in the
+        # background; c is served stale without a refresh (retried next read).
+        assert cache.metrics().background_refresh_started == 2
+        assert set(cache._refreshing) == {"a", "b"}
+
+        # Insert a brand-new key while both refreshes are still in flight.
+        rd = await cache.get("d", loaders["d"])
+        assert rd.status == ReadStatus.HIT
+
+        # The just-written entry survives; the LRU reclaimable entry (c) went.
+        assert len(cache) == 3
+        assert "d" in cache._entries
+        assert "a" in cache._entries and "b" in cache._entries  # pinned
+        assert "c" not in cache._entries
+        assert cache.metrics().evictions == 1
+
+        # Reading d again is served from cache: no repeated upstream fetch.
+        rd2 = await cache.get("d", loaders["d"])
+        assert rd2.status == ReadStatus.HIT
+        assert upstream.call_count("d") == 1
+
+        # The evicted entry reloads from upstream and is re-cached.
+        rc2 = await cache.get("c", loaders["c"])
+        assert rc2.status == ReadStatus.HIT and rc2.value == "c"
+        assert upstream.call_count("c") == 2
+        assert len(cache) == 3  # capacity bound still holds
+
+        await asyncio.sleep(0.6)  # let the background refreshes finish
+        assert cache._refreshing == {}
+        assert cache._entries["a"].version == 2
+        assert cache._entries["b"].version == 2
+        await cache.shutdown()
+
+    run(scenario())
+
+
+def test_refreshing_entries_are_pinned_then_reenter_reclaimable_pool(clock):
+    """Pinned entries are skipped even when they are the LRU; once the refresh
+    finishes they can be evicted again."""
+    upstream = MockUpstream()
+    cache = make_cache(clock, capacity=3)
+    loaders = {}
+    for name in ("a", "b", "c", "d", "e"):
+        upstream.set(name, name)
+        loaders[name] = make_loader(upstream, name, (name,))
+
+    async def scenario():
+        await cache.get("a", loaders["a"])
+        clock.advance(1.0)
+        await cache.get("b", loaders["b"])
+        clock.advance(1.0)
+        await cache.get("c", loaders["c"])
+
+        upstream.configure("a", delay=0.5)
+        upstream.configure("b", delay=0.5)
+        clock.advance(13.0)
+        await cache.get("a", loaders["a"])  # stale -> pinned refresh
+        await cache.get("b", loaders["b"])  # stale -> pinned refresh
+        clock.advance(1.0)
+        await cache.get("c", loaders["c"])  # fresh hit: c is now the newest
+
+        # a and b are the least-recently-used overall, but they are pinned:
+        # the victim must be c (the LRU *reclaimable* entry).
+        await cache.get("d", loaders["d"])
+        assert "a" in cache._entries and "b" in cache._entries
+        assert "c" not in cache._entries
+        assert "d" in cache._entries
+        assert cache.metrics().evictions == 1
+
+        await asyncio.sleep(0.6)  # refreshes finish -> a and b reclaimable again
+        assert cache._refreshing == {}
+
+        # Now the oldest entries (a, then b) are evictable again.
+        await cache.get("e", loaders["e"])
+        assert len(cache) == 3
+        assert "a" not in cache._entries  # evicted as LRU after re-entering pool
+        assert cache.metrics().evictions == 2
+        await cache.shutdown()
+
+    run(scenario())
+
+
+def test_capacity_bound_holds_with_refresh_in_flight_and_many_inserts(clock):
+    """capacity=2 with a hanging refresh: inserting many new keys never exceeds
+    the capacity and never drops the just-written key."""
+    upstream = MockUpstream()
+    cache = make_cache(clock, capacity=2)
+    upstream.set("a", "a")
+    upstream.set("b", "b")
+    la = make_loader(upstream, "a", ("a",))
+    lb = make_loader(upstream, "b", ("b",))
+
+    async def scenario():
+        await cache.get("a", la)
+        clock.advance(1.0)
+        await cache.get("b", lb)
+
+        upstream.configure("a", delay=0.5)  # a's refresh hangs in flight
+        clock.advance(13.0)
+        ra = await cache.get("a", la)
+        assert ra.status == ReadStatus.STALE
+        assert cache.metrics().background_refresh_started == 1
+
+        # Pin budget is capacity - 1 == 1: no second refresh is spawned while
+        # a is pinned, so eviction always keeps a reclaimable victim.
+        rb = await cache.get("b", lb)
+        assert rb.status == ReadStatus.STALE
+        assert cache.metrics().background_refresh_started == 1
+
+        for i in range(8):
+            key = f"k{i}"
+            upstream.set(key, key)
+            r = await cache.get(key, make_loader(upstream, key, (key,)))
+            assert r.status == ReadStatus.HIT
+            assert len(cache) <= 2  # hard bound at every instant
+            assert key in cache._entries  # just-written entry never dropped
+            assert "a" in cache._entries  # pinned entry never evicted
+
+        await asyncio.sleep(0.6)  # refresh finishes; a re-enters the pool
+        assert cache._refreshing == {}
+        assert len(cache) <= 2
+
+        # a is reclaimable again: further inserts may evict it.
+        upstream.set("z", "z")
+        await cache.get("z", make_loader(upstream, "z", ("z",)))
+        assert len(cache) <= 2
+        await cache.shutdown()
+
+    run(scenario())
+
+
+def test_evicted_entry_reloads_and_recaches_under_refresh_pressure(clock):
+    """An entry evicted while other refreshes are in flight reloads from the
+    upstream on the next read and is written back completely."""
+    upstream = MockUpstream()
+    cache = make_cache(clock, capacity=2)
+    loaders = {}
+    for name in ("a", "b", "c"):
+        upstream.set(name, name)
+        loaders[name] = make_loader(upstream, name, (name,))
+
+    async def scenario():
+        await cache.get("a", loaders["a"])
+        clock.advance(1.0)
+        await cache.get("b", loaders["b"])
+
+        upstream.configure("a", delay=0.5)
+        clock.advance(13.0)
+        await cache.get("a", loaders["a"])  # stale -> pinned refresh of a
+
+        await cache.get("c", loaders["c"])  # inserts c, evicts b (LRU reclaimable)
+        assert "b" not in cache._entries
+        assert len(cache) == 2
+
+        calls_b = upstream.call_count("b")
+        upstream.set("b", "b2")
+        rb = await cache.get("b", loaders["b"])  # evicted -> back to upstream
+        assert rb.status == ReadStatus.HIT
+        assert rb.value == "b2"
+        assert upstream.call_count("b") == calls_b + 1
+        assert "b" in cache._entries  # re-cached as a complete entry
+        assert len(cache) == 2
+
+        await asyncio.sleep(0.6)
+        await cache.shutdown()
+
+    run(scenario())
+
+
+def test_concurrent_reads_inserts_evictions_return_complete_versions(clock):
+    """Eviction, insertion and concurrent reads interleaved: every result is a
+    fully written version and the capacity bound holds throughout."""
+    upstream = MockUpstream(delay=0.01)
+    cache = make_cache(clock, capacity=3)
+    keys = ["k0", "k1", "k2", "k3", "k4"]
+    loaders = {k: make_loader(upstream, k, (k,)) for k in keys}
+    written: dict[str, set[str]] = {k: set() for k in keys}
+
+    async def scenario():
+        for round_no in range(6):
+            for k in keys:
+                value = f"{k}-v{round_no}"
+                upstream.set(k, value)
+                written[k].add(value)
+            # 20 concurrent reads over 5 keys with capacity 3: constant
+            # insert/evict churn, some keys stale, some expired.
+            results = await asyncio.gather(
+                *[cache.get(k, loaders[k]) for k in keys for _ in range(4)]
+            )
+            for i, r in enumerate(results):
+                k = keys[i // 4]
+                assert r.found
+                # The value is always one complete write for this key —
+                # never a mix of two versions or a half-written payload.
+                assert r.value in written[k]
+                assert r.version >= 1
+            assert len(cache) <= 3
+            clock.advance(15.0)  # push entries through the stale window
+        await cache.shutdown()
+
+    run(scenario())
