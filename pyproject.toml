@@ -10,3 +10,12 @@ dependencies = [
 [[tool.uv.index]]
 url = "https://mirrors.aliyun.com/pypi/simple/"
 default = true
+
+[tool.pytest.ini_options]
+# Run the suite the usual uv way from the repository root:
+#   uv run pytest
+# Putting the repository root on sys.path lets the tests import the
+# top-level ``cache_layer`` package and the ``main`` demo module without
+# requiring an editable install or a special launcher.
+pythonpath = ["."]
+testpaths = ["tests"]

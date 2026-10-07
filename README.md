@@ -74,9 +74,29 @@ a single entry directly.
 
 - Capacity is configurable and hard-capped (`1..100_000`) to prevent
   misconfiguration from causing unbounded memory growth.
-- When capacity is exceeded, the least-recently-used entry is evicted
-  (LRU). Entries with a refresh in flight are never chosen as victims.
-- Evicted entries are reloaded from the upstream on the next read.
+- When capacity is exceeded, the least-recently-used **evictable** entry is
+  evicted (LRU; ties are broken by key for deterministic behavior).
+- An entry with a background refresh in flight is **not evictable** until that
+  refresh finishes. Eviction therefore never races a refresh into removing
+  data that is being rewritten, and a refresh never resurrects an evicted
+  entry. Once the refresh completes, the entry holds a complete, coherent
+  version and immediately re-enters the evictable pool.
+- When the cache is full and *every* entry is momentarily protected by an
+  in-flight refresh, a new/expired-key load waits for the next refresh to
+  finish and then evicts the genuine LRU entry. It never evicts the entry it
+  just wrote: a freshly loaded value is present immediately and the next read
+  is served from cache instead of going back upstream.
+- Consequently, regardless of how many refreshes are running concurrently,
+  the number of cached entries never exceeds `capacity`, and long-running
+  workloads (churn, repeated stale revalidation) cannot grow memory without
+  bound.
+- Insertion, eviction and the background swap happen under the cache's
+  structural lock, and every entry is a fully constructed object swapped in by
+  reference. Reads interleaved with eviction/insertion therefore always
+  observe exactly one complete, previously written version — never a
+  half-written or new/old-mixed value.
+- Evicted entries are reloaded from the upstream on the next read and written
+  back under the same capacity rules.
 
 ## Observability
 
@@ -135,13 +155,36 @@ with `FakeClock`.
 
 ## Tests
 
+From the repository root, run the suite the usual `uv` way:
+
 ```bash
-python -m pytest tests/ -q
+uv run pytest
 ```
 
-The test suite covers: threshold boundaries, stale-while-revalidate,
-background and synchronous refresh failure with degradation, not-found vs
-fault distinction (timeout/error/malformed), precise dependency
-invalidation, concurrent reads sharing a single refresh without mixed
-versions, background refresh concurrency limit, LRU eviction and reload,
-metrics, and graceful shutdown (no half-written entries, no blocking).
+(or explicitly `uv run pytest tests/ -q`). No editable install or special
+launcher is required; `pyproject.toml` puts the repository root on the test
+`sys.path` so the top-level `cache_layer` package and the `main` demo module
+import cleanly, and all tests are collected and run with that single command.
+
+The suite covers threshold boundaries, stale-while-revalidate, background and
+synchronous refresh failure with degradation, not-found vs fault distinction
+(timeout/error/malformed), precise dependency invalidation, concurrent reads
+sharing a single refresh without mixed versions, background refresh
+concurrency limit, LRU eviction and reload, metrics, and graceful shutdown
+(no half-written entries, no blocking).
+
+The `Capacity & eviction under concurrent background refreshes` tests
+additionally deterministically reproduce:
+
+- several entries refreshing in the background while a new key is read: the
+  just-written entry survives its own write and is not re-fetched on the next
+  read (no repeated upstream round-trips);
+- the total entry count staying at or below `capacity` while many refreshes
+  are in flight and new keys keep arriving;
+- LRU victim selection restricted to currently evictable entries, and
+  refreshed entries becoming evictable again only after their refresh ends;
+- an entry evicted while siblings refresh being reloaded from upstream and
+  rewritten with capacity still bounded;
+- long interleaved churn never exceeding capacity and never growing memory;
+- read/insert/evict interleaving that only ever returns complete versions;
+- shutdown promptly releasing a foreground insert that is waiting for a slot.

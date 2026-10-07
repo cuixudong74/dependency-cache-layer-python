@@ -708,3 +708,391 @@ def test_stale_ttl_zero_disables_stale_window(clock):
     assert r.status == ReadStatus.HIT
     assert r.value == "v2"
     assert cache.metrics().stale_returns == 0
+
+
+# ---------------------------------------------------------------------------
+# 10. Capacity & eviction under concurrent background refreshes
+# ---------------------------------------------------------------------------
+
+
+def _make_gated_loader(key, gate, upstream_calls):
+    """Loader that blocks on ``gate`` once a background refresh is running."""
+
+    async def loader():
+        upstream_calls.append(key)
+        if gate is not None and gate["active"]:
+            await gate["event"].wait()
+        return LoadResult(value=key, deps=(key,))
+
+    return loader
+
+
+async def _prime_stale_blocked(cache, clock, keys, gate, upstream_calls,
+                               prime_keys=None):
+    """Prime every key fresh, push them stale, block their bg refreshes.
+
+    ``prime_keys`` may include extra keys that stay cached but are not moved
+    into the stale window; they keep an older access time and are the natural
+    LRU victims.
+    """
+    prime_keys = list(prime_keys or keys)
+    for k in prime_keys:
+        r = await cache.get(k, _make_gated_loader(k, None, upstream_calls))
+        assert r.found
+    if prime_keys != list(keys):
+        clock.advance(1.0)  # gap so the stale keys are newer than stale-stay keys
+    clock.advance(15.0)  # ``keys`` enter the stale window
+    gate["active"] = True
+    results = await asyncio.gather(
+        *[cache.get(k, _make_gated_loader(k, gate, upstream_calls)) for k in keys]
+    )
+    assert all(r.status == ReadStatus.STALE for r in results)
+    # Let the spawned background tasks start and park on the gate.
+    await asyncio.sleep(0.05)
+    assert sorted(cache._refreshing) == sorted(keys)
+
+
+def test_new_entry_survives_while_many_entries_refresh(clock):
+    """A just-written entry must not be evicted while other keys refresh.
+
+    Regression: with a small capacity and several entries refreshing in the
+    background, the new entry used to be the only evictable candidate and was
+    dropped the instant it was written, forcing the next read back upstream.
+    """
+    cache = make_cache(clock, capacity=3)
+    keys = ("a", "b", "c")
+    gate = {"event": asyncio.Event(), "active": False}
+    upstream_calls: list[str] = []
+
+    async def scenario():
+        await _prime_stale_blocked(cache, clock, keys, gate, upstream_calls)
+
+        calls_before = len(upstream_calls)
+        # Independent upstream completion (as a real upstream would finish).
+        async def release():
+            await asyncio.sleep(0.05)
+            gate["event"].set()
+
+        rel = asyncio.create_task(release())
+        r = await cache.get("d", _make_gated_loader("d", None, upstream_calls))
+        assert r.status == ReadStatus.HIT and r.value == "d"
+
+        # The freshly written entry is immediately present and bounded.
+        assert "d" in cache._entries
+        assert len(cache) <= 3
+
+        await rel
+        await asyncio.sleep(0.05)
+        assert len(cache) == 3
+        assert "d" in cache._entries
+
+        # Re-reading d must be a cache hit, never a second upstream fetch.
+        calls_d_before = upstream_calls.count("d")
+        r2 = await cache.get("d", _make_gated_loader("d", gate, upstream_calls))
+        assert r2.status == ReadStatus.HIT and r2.value == "d"
+        assert upstream_calls.count("d") == calls_d_before
+        assert len(upstream_calls) == calls_before + 1  # only d's single load
+        await cache.shutdown()
+
+    run(scenario())
+
+
+def test_capacity_never_exceeded_while_multiple_refreshes_in_flight(clock):
+    """Total entries stay <= capacity even when all entries are refreshing."""
+    cache = make_cache(clock, capacity=4)
+    keys = ("a", "b", "c", "d")
+    gate = {"event": asyncio.Event(), "active": False}
+    upstream_calls: list[str] = []
+
+    async def scenario():
+        await _prime_stale_blocked(cache, clock, keys, gate, upstream_calls)
+
+        sizes: list[int] = []
+
+        async def read_new(name):
+            r = await cache.get(name, _make_gated_loader(name, None, upstream_calls))
+            sizes.append(len(cache))
+            assert r.found and r.value == name
+            assert len(cache) <= 4
+
+        async def release():
+            await asyncio.sleep(0.02)
+            gate["event"].set()
+
+        rel = asyncio.create_task(release())
+        await asyncio.gather(*(read_new(n) for n in ("e", "f", "g")))
+        rel.cancel()
+        await asyncio.sleep(0.1)
+
+        assert max(sizes) <= 4
+        assert len(cache) == 4
+        # Every currently cached key reads back straight from cache.
+        for k in list(cache._entries):
+            before = upstream_calls.count(k)
+            r = await cache.get(k, _make_gated_loader(k, gate, upstream_calls))
+            assert r.status == ReadStatus.HIT
+            assert upstream_calls.count(k) == before
+        await cache.shutdown()
+
+    run(scenario())
+
+
+def test_eviction_picks_lru_among_evictable_and_revives_after_refresh():
+    """LRU victim = least recently used non-refreshing entry; refreshed
+    entries re-enter the evictable pool once their refresh ends.
+
+    Uses the real clock (distinct access timestamps) so LRU order is
+    unambiguous rather than tied on a frozen FakeClock.
+    """
+    from cache_layer import SystemClock
+
+    cache = CacheLayer(
+        # TTLs scaled to the small real-time waits used below.
+        CacheConfig(fresh_ttl=0.05, stale_ttl=5.0, negative_ttl=0.05, capacity=4),
+        clock=SystemClock(),
+    )
+    keys = ("a", "b", "c")
+    gates = {k: asyncio.Event() for k in keys}
+    upstream_calls: list[str] = []
+
+    def plain_loader(k):
+        async def loader():
+            upstream_calls.append(k)
+            return LoadResult(value=k, deps=(k,))
+
+        return loader
+
+    def gated_loader(k):
+        async def loader():
+            upstream_calls.append(k)
+            await gates[k].wait()  # only background refreshes reach here
+            return LoadResult(value=k, deps=(k,))
+
+        return loader
+
+    async def scenario():
+        # d is primed first and never refreshed -> it stays the oldest access.
+        for k in ("d", *keys):
+            r = await cache.get(k, plain_loader(k))
+            assert r.found
+            await asyncio.sleep(0.005)
+        await asyncio.sleep(0.05)  # cross fresh_ttl into the stale window
+
+        # Start the three background refreshes and park them on their gates.
+        stale_results = await asyncio.gather(
+            *[cache.get(k, gated_loader(k)) for k in keys]
+        )
+        assert all(r.status == ReadStatus.STALE for r in stale_results)
+        await asyncio.sleep(0.05)
+        assert sorted(cache._refreshing) == list(keys)
+
+        # a/b/c protected: only d is evictable -> inserting e evicts d (LRU).
+        r = await cache.get("e", plain_loader("e"))
+        assert r.found
+        assert "d" not in cache._entries
+        assert set(cache._entries) == {"a", "b", "c", "e"}
+        assert cache.metrics().evictions == 1
+
+        # Let only 'a' finish and settle: it becomes evictable again with a
+        # fresh access, while b/c stay protected behind their gates.
+        gates["a"].set()
+        await asyncio.sleep(0.05)
+        assert "a" not in cache._refreshing
+        assert "b" in cache._refreshing and "c" in cache._refreshing
+
+        # Inserting f reclaims the oldest evictable entry: e (written earlier),
+        # never the just-refreshed a or the protected b/c.
+        r = await cache.get("f", plain_loader("f"))
+        assert r.found and r.value == "f"
+
+        assert len(cache) == 4
+        assert "e" not in cache._entries
+        assert "a" in cache._entries  # a refreshed and re-entered the pool
+        assert "f" in cache._entries
+        assert cache.metrics().evictions == 2
+
+        # b/c are still refreshing and therefore still protected.
+        assert "b" in cache._refreshing and "c" in cache._refreshing
+
+        # Release the rest and confirm capacity stays bounded afterwards.
+        gates["b"].set()
+        gates["c"].set()
+        await asyncio.sleep(0.05)
+        assert len(cache) == 4
+        await cache.shutdown()
+
+    run(scenario())
+
+
+def test_evicted_entry_reloads_and_rewrites_after_concurrent_refresh(clock):
+    """An entry evicted while siblings refresh is reloaded on next read and
+    written back, with capacity staying bounded and a complete value served."""
+    cache = make_cache(clock, capacity=3)
+    keys = ("a", "b", "c")
+    gate = {"event": asyncio.Event(), "active": False}
+    upstream_calls: list[str] = []
+
+    async def scenario():
+        await _prime_stale_blocked(cache, clock, keys, gate, upstream_calls)
+
+        gate["event"].set()
+        # d displaces exactly one of a/b/c once a slot frees up.
+        r = await cache.get("d", _make_gated_loader("d", None, upstream_calls))
+        assert r.found and r.value == "d"
+        await asyncio.sleep(0.05)
+        assert len(cache) == 3
+        assert "d" in cache._entries
+        displaced = [k for k in keys if k not in cache._entries]
+        assert len(displaced) == 1
+        victim = displaced[0]
+
+        # Reading the evicted entry goes back to upstream and rewrites it.
+        # Touch the two still-cached keys so they are the LRU-ordered older
+        # entries; the freshly rewritten victim must be the survivor.
+        survivors = [k for k in keys if k in cache._entries]
+        clock.advance(1.0)
+        for k in survivors:
+            touch = await cache.get(k, _make_gated_loader(k, gate, upstream_calls))
+            assert touch.status == ReadStatus.HIT
+        before = upstream_calls.count(victim)
+        r = await cache.get(victim, _make_gated_loader(victim, None, upstream_calls))
+        assert r.status == ReadStatus.HIT and r.value == victim
+        assert upstream_calls.count(victim) == before + 1
+        assert victim in cache._entries
+        assert len(cache) == 3
+        await cache.shutdown()
+
+    run(scenario())
+
+
+def test_capacity_stays_bounded_under_long_concurrent_churn(clock):
+    """Long-running interleaving of refreshes/inserts never grows memory."""
+    cache = make_cache(
+        clock, capacity=5, max_refresh_concurrency=4, fresh_ttl=10.0, stale_ttl=20.0
+    )
+    upstream_calls: list[str] = []
+    gate = {"event": asyncio.Event(), "active": False}
+
+    async def scenario():
+        gate["event"].set()  # refreshes never block here
+        names = [f"k{i}" for i in range(5)]
+        for n in names:
+            await cache.get(n, _make_gated_loader(n, None, upstream_calls))
+
+        for round_no in range(8):
+            clock.advance(15.0)  # make everything stale
+            # Background refreshes for existing keys interleaved with new keys.
+            reads = [cache.get(n, _make_gated_loader(n, gate, upstream_calls))
+                     for n in names]
+            reads += [
+                cache.get(f"new{round_no}:{i}",
+                          _make_gated_loader(f"new{round_no}:{i}", None, upstream_calls))
+                for i in range(3)
+            ]
+            results = await asyncio.gather(*reads)
+            assert all(r.found for r in results)
+            assert len(cache) <= 5
+            await asyncio.sleep(0.02)
+
+        assert len(cache) == 5
+        await cache.shutdown()
+
+    run(scenario())
+
+
+def test_interleaved_refresh_insert_reads_never_mix_versions(clock):
+    """Under refresh/insert/evict interleaving every read is one complete
+    version whose value and version number are internally consistent."""
+    cache = make_cache(clock, capacity=3)
+    upstream_calls: list[str] = []
+    gate = {"event": asyncio.Event(), "active": False}
+
+    def value_loader(key, value):
+        async def loader():
+            upstream_calls.append(key)
+            if gate["active"]:
+                await gate["event"].wait()
+            return LoadResult(value={"k": key, "v": value}, deps=(key,))
+
+        return loader
+
+    async def scenario():
+        for i, k in enumerate(("a", "b", "c")):
+            r = await cache.get(k, value_loader(k, i))
+            assert r.value == {"k": k, "v": i}
+        clock.advance(15.0)
+        gate["active"] = True
+
+        # Trigger background refreshes that write new complete versions.
+        await asyncio.gather(*[cache.get(k, value_loader(k, 100 + i))
+                               for i, k in enumerate(("a", "b", "c"))])
+        await asyncio.sleep(0.05)
+
+        observed: list[tuple[str, int]] = []
+
+        async def reader(k):
+            idx = {"a": 0, "b": 1, "c": 2}[k]
+            for _ in range(20):
+                # A reload (after eviction) returns the current upstream tag.
+                r = await cache.get(k, value_loader(k, 100 + idx))
+                # A coherent, fully written version: value matches its tag.
+                assert r.value["k"] == k
+                assert r.value["v"] in (idx, 100 + idx)
+                observed.append((r.status.value, r.version))
+                await asyncio.sleep(0)
+
+        async def inserter():
+            for i in range(10):
+                n = f"x{i % 4}"
+                r = await cache.get(n, value_loader(n, i))
+                # Coherence only: the returned object is one complete write,
+                # never a mix (a cache hit may legitimately return an earlier
+                # fully-written version of the same key: a previous round j
+                # with the same j % 4).
+                assert r.value["k"] == n
+                assert r.value["v"] % 4 == i % 4
+                assert r.value["v"] <= i
+                assert len(cache) <= 3
+                await asyncio.sleep(0)
+
+        async def release():
+            await asyncio.sleep(0.02)
+            gate["event"].set()
+
+        await asyncio.gather(release(), inserter(),
+                             *[reader(k) for k in ("a", "b", "c")])
+        await cache.shutdown()
+
+    run(scenario())
+
+
+def test_waiting_insert_is_released_by_shutdown(clock):
+    """Shutdown must not hang when a foreground insert awaits a slot."""
+    cache = make_cache(clock, capacity=2)
+    keys = ("a", "b")
+    gate = {"event": asyncio.Event(), "active": False}
+    upstream_calls: list[str] = []
+
+    async def scenario():
+        await _prime_stale_blocked(cache, clock, keys, gate, upstream_calls)
+        # Never release the gate; shutdown must still unblock the insert.
+        r_get = asyncio.create_task(
+            cache.get("c", _make_gated_loader("c", None, upstream_calls))
+        )
+        await asyncio.sleep(0.05)
+        loop = asyncio.get_event_loop()
+        start = loop.time()
+        await cache.shutdown(timeout=0.2)
+        assert loop.time() - start < 2.0
+        assert r_get.done()  # the waiting insert returned, it did not hang
+        if not r_get.cancelled():
+            # If the insert managed to complete during shutdown, its value is
+            # fully written and capacity is still respected.
+            result = r_get.result()
+            assert result.found and result.value == "c"
+            assert len(cache) <= 2
+        # New reads are refused after shutdown.
+        with pytest.raises(RuntimeError):
+            await cache.get("z", _make_gated_loader("z", None, upstream_calls))
+
+    run(scenario())
